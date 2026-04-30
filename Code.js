@@ -117,13 +117,8 @@ function runInvoiceScan_(daysToScan) {
         subjectForLog = fields.subject || msgId;
         log_('Processing subject: "' + subjectForLog + '"');
 
-        const outcome = processMessage_(msg, fields, results);
+        processMessage_(msg, fields, results);
         results.processed++;
-
-        if (outcome === 'invoice') results.invoices++;
-        else if (outcome === 'flagged') results.flagged++;
-        else if (outcome === 'duplicate') results.duplicates++;
-        else results.skipped++;
 
         if (CONFIG.APPLY_PROCESSED_LABEL && processedLabelId) {
           try {
@@ -467,20 +462,38 @@ function saveEmlToDrive_(msg, fields, nameBase) {
 // PROCESSING
 // ============================================================
 
+function classifyStatus_(aiResult, isLowConfidence) {
+  if (isLowConfidence) return '⚠️ Flagged for review';
+  if (aiResult.classification === 'invoice_due' || aiResult.classification === 'payment_request') return 'Payable';
+  if (aiResult.classification === 'receipt_or_invoice_already_paid') return 'Paid';
+  return 'Other';
+}
+
+function getEmailDedupeRow_() {
+  try {
+    const sheet = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID).getSheetByName(CONFIG.TARGET_SHEET);
+    return sheet ? sheet.getLastRow() : 0;
+  } catch (e) {
+    return 0;
+  }
+}
+
 function processMessage_(msg, fields, results) {
   const subject = fields.subject;
   const from = fields.from;
   const body = fields.body;
   const attachmentNames = fields.attachmentNames;
   const hasPdf = fields.pdfAttachments && fields.pdfAttachments.length > 0;
+  const msgId = msg.id || msg._messageId || '';
 
   log_('Step: basic validation');
-  if (!subject && !from && !body) return 'skipped';
+  if (!subject && !from && !body) { results.skipped++; return 'skipped'; }
 
   // Pre-screen only applies when there is no PDF attachment
   log_('Step: pre-screen');
   if (!hasPdf && isDefinitelyNotInvoice_(subject, from, body)) {
     log_('PRE-SCREEN SKIP: ' + subject);
+    results.skipped++;
     return 'skipped';
   }
 
@@ -488,45 +501,93 @@ function processMessage_(msg, fields, results) {
   const apiKey = getApiKey_();
   log_('API key present: ' + (!!apiKey));
 
-  let pdfBlob = null;
-  let anthropicFileId = '';
+  if (!hasPdf) {
+    // Email-only path — no PDF attachments
+    const aiResult = callClaudeForInvoiceFromEmailOnly_(subject, from, body, attachmentNames, apiKey);
+    if (!aiResult || typeof aiResult !== 'object') throw new Error('Claude result was empty or invalid');
 
-  if (hasPdf) {
-    const pdf = chooseBestPdfAttachment_(fields.pdfAttachments);
-    log_('Using PDF attachment: ' + pdf.filename);
-    pdfBlob = fetchGmailAttachmentBlob_(msg.id || msg._messageId || '', pdf);
-    anthropicFileId = uploadPdfToAnthropicFiles_(pdfBlob);
-    results.pdf_uploaded++;
-    log_('Uploaded PDF to Anthropic Files API: ' + anthropicFileId);
+    if (SKIP_CLASSIFICATIONS.indexOf(aiResult.classification) !== -1) {
+      log_('AI SKIP (' + (aiResult.classification || 'unknown') + ', confidence=' + aiResult.confidence + '): ' + subject);
+      results.skipped++;
+      return 'skipped';
+    }
+
+    const isLowConfidence = Number(aiResult.confidence || 0) < CONFIG.CONFIDENCE_THRESHOLD;
+    const status = classifyStatus_(aiResult, isLowConfidence);
+    const nameBase = buildFinalNameBase_(fields, aiResult);
+
+    let emlFile = null;
+    try {
+      const emlNameBase = isLowConfidence ? 'FLAGGED - ' + nameBase : nameBase;
+      emlFile = saveEmlToDrive_(msg, fields, emlNameBase);
+      log_('Saved EML to Drive: ' + emlFile.getName());
+    } catch (e) {
+      log_('EML Drive save failed: ' + safeError_(e));
+    }
+
+    const writeResult = writeInvoiceToSheet_(aiResult, msgId, fields, status, null, emlFile);
+    if (writeResult.duplicate) {
+      log_('DUPLICATE SKIP: row ' + writeResult.row + ' | ' + subject);
+      results.duplicates++;
+      return 'duplicate';
+    }
+
+    log_((isLowConfidence ? 'FLAGGED' : 'INVOICE') + ': ' + subject);
+    if (isLowConfidence) { results.flagged++; return 'flagged'; }
+    results.invoices++;
+    return 'invoice';
   }
 
-  const aiResult = hasPdf
-    ? callClaudeForInvoiceFromPdf_(subject, from, body, attachmentNames, anthropicFileId)
-    : callClaudeForInvoiceFromEmailOnly_(subject, from, body, attachmentNames, apiKey);
+  // Multi-PDF path: process every attachment as a separate invoice row.
+  // emailDedupeRow is the last sheet row *before* we start writing for this email,
+  // so the email-link duplicate check won't falsely flag the 2nd/3rd PDF from the same email.
+  log_('Processing ' + fields.pdfAttachments.length + ' PDF attachment(s)');
+  const emailDedupeRow = getEmailDedupeRow_();
+  let emlFile = null;   // saved once per email, linked to all rows
+  let anyInvoice = false;
+  let anyFlagged = false;
+  let anyDuplicate = false;
+  let anyNonSkip = false;
 
-  if (!aiResult || typeof aiResult !== 'object') throw new Error('Claude result was empty or invalid');
+  for (let i = 0; i < fields.pdfAttachments.length; i++) {
+    const pdf = fields.pdfAttachments[i];
+    log_('--- PDF ' + (i + 1) + '/' + fields.pdfAttachments.length + ': ' + pdf.filename);
 
-  if (SKIP_CLASSIFICATIONS.indexOf(aiResult.classification) !== -1) {
-    log_('AI SKIP (' + (aiResult.classification || 'unknown') + ', confidence=' + aiResult.confidence + '): ' + subject);
-    return 'skipped';
-  }
+    let pdfBlob, anthropicFileId;
+    try {
+      pdfBlob = fetchGmailAttachmentBlob_(msgId, pdf);
+      anthropicFileId = uploadPdfToAnthropicFiles_(pdfBlob);
+      results.pdf_uploaded++;
+      log_('Uploaded to Anthropic Files: ' + anthropicFileId);
+    } catch (e) {
+      log_('Failed to upload PDF ' + pdf.filename + ': ' + safeError_(e));
+      continue;
+    }
 
-  const isLowConfidence = Number(aiResult.confidence || 0) < CONFIG.CONFIDENCE_THRESHOLD;
-  let status;
-  if (isLowConfidence) {
-    status = '⚠️ Flagged for review';
-  } else if (aiResult.classification === 'invoice_due' || aiResult.classification === 'payment_request') {
-    status = 'Payable';
-  } else if (aiResult.classification === 'receipt_or_invoice_already_paid') {
-    status = 'Paid';
-  } else {
-    status = 'Other';
-  }
+    let aiResult;
+    try {
+      aiResult = callClaudeForInvoiceFromPdf_(subject, from, body, attachmentNames, anthropicFileId);
+    } catch (e) {
+      log_('Claude failed for PDF ' + pdf.filename + ': ' + safeError_(e));
+      continue;
+    }
 
-  const nameBase = buildFinalNameBase_(fields, aiResult);
+    if (!aiResult || typeof aiResult !== 'object') {
+      log_('Empty Claude result for PDF: ' + pdf.filename);
+      continue;
+    }
 
-  let driveFile = null;
-  if (pdfBlob) {
+    if (SKIP_CLASSIFICATIONS.indexOf(aiResult.classification) !== -1) {
+      log_('AI SKIP (' + aiResult.classification + '): ' + pdf.filename);
+      continue;
+    }
+
+    anyNonSkip = true;
+    const isLowConfidence = Number(aiResult.confidence || 0) < CONFIG.CONFIDENCE_THRESHOLD;
+    const status = classifyStatus_(aiResult, isLowConfidence);
+    const nameBase = buildFinalNameBase_(fields, aiResult);
+
+    let driveFile = null;
     try {
       driveFile = savePdfToDrive_(pdfBlob, fields, nameBase);
       results.pdf_saved++;
@@ -534,24 +595,51 @@ function processMessage_(msg, fields, results) {
     } catch (e) {
       log_('PDF Drive save failed: ' + safeError_(e));
     }
+
+    if (!emlFile) {
+      try {
+        emlFile = saveEmlToDrive_(msg, fields, nameBase);
+        log_('Saved EML to Drive: ' + emlFile.getName());
+      } catch (e) {
+        log_('EML Drive save failed: ' + safeError_(e));
+      }
+    }
+
+    const writeResult = writeInvoiceToSheet_(aiResult, msgId, fields, status, driveFile, emlFile, emailDedupeRow);
+    if (writeResult.duplicate) {
+      log_('DUPLICATE SKIP: row ' + writeResult.row + ' | ' + pdf.filename);
+      results.duplicates++;
+      anyDuplicate = true;
+    } else if (isLowConfidence) {
+      log_('FLAGGED: ' + pdf.filename);
+      results.flagged++;
+      anyFlagged = true;
+    } else {
+      log_('INVOICE: ' + pdf.filename);
+      results.invoices++;
+      anyInvoice = true;
+    }
+
+    if (i < fields.pdfAttachments.length - 1) Utilities.sleep(CONFIG.LOOP_SLEEP_MS);
   }
 
-  let emlFile = null;
-  try {
-    emlFile = saveEmlToDrive_(msg, fields, nameBase);
-    log_('Saved EML to Drive: ' + emlFile.getName());
-  } catch (e) {
-    log_('EML Drive save failed: ' + safeError_(e));
+  // If any invoice from this email was flagged, prefix the EML filename so it's identifiable
+  // in the folder even when emails contain a mix of payable and flagged invoices.
+  if (emlFile && anyFlagged) {
+    try {
+      emlFile.setName('FLAGGED - ' + emlFile.getName());
+      log_('EML renamed with FLAGGED prefix.');
+    } catch (e) {
+      log_('EML rename failed: ' + safeError_(e));
+    }
   }
 
-  const writeResult = writeInvoiceToSheet_(aiResult, msg.id || msg._messageId || '', fields, status, driveFile, emlFile);
-  if (writeResult.duplicate) {
-    log_('DUPLICATE SKIP: row ' + writeResult.row + ' | ' + subject);
-    return 'duplicate';
-  }
-
-  log_((isLowConfidence ? 'FLAGGED' : 'INVOICE') + ': ' + subject);
-  return isLowConfidence ? 'flagged' : 'invoice';
+  if (!anyNonSkip) { results.skipped++; return 'skipped'; }
+  if (anyInvoice) return 'invoice';
+  if (anyFlagged) return 'flagged';
+  if (anyDuplicate) return 'duplicate';
+  results.skipped++;
+  return 'skipped';
 }
 
 function chooseBestPdfAttachment_(attachments) {
@@ -799,7 +887,7 @@ function callAnthropicMessages_(payload, useFilesBeta) {
 // SHEETS + DUPLICATES
 // ============================================================
 
-function writeInvoiceToSheet_(data, msgId, fields, status, driveFile, emlFile) {
+function writeInvoiceToSheet_(data, msgId, fields, status, driveFile, emlFile, emailDedupeRow) {
   const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
   const sheet = ss.getSheetByName(CONFIG.TARGET_SHEET);
   if (!sheet) throw new Error('Sheet "' + CONFIG.TARGET_SHEET + '" not found');
@@ -812,13 +900,13 @@ function writeInvoiceToSheet_(data, msgId, fields, status, driveFile, emlFile) {
   const emailLink = msgId ? ('https://mail.google.com/mail/u/0/#inbox/' + msgId) : '';
   const dateEmailReceived = formatEmailReceived_(fields);
 
-  const duplicateRow = findDuplicateRow_(sheet, data, emailLink);
+  const duplicateRow = findDuplicateRow_(sheet, data, emailLink, emailDedupeRow);
   if (duplicateRow > 0) {
     return { duplicate: true, row: duplicateRow };
   }
 
   const driveFileUrl = driveFile ? driveFile.getUrl() : '';
-  const emlFileUrl = emlFile ? emlFile.getUrl() : '';
+  const emlFileUrl = emlFile ? emlFile.getParents().next().getUrl() : '';
 
   const row = new Array(15).fill('');
   row[COL.INVOICE_NUMBER - 1] = nullToEmpty_(data.invoice_number);
@@ -862,9 +950,14 @@ function writeInvoiceToSheet_(data, msgId, fields, status, driveFile, emlFile) {
   return { duplicate: false, row: sheet.getLastRow() };
 }
 
-function findDuplicateRow_(sheet, data, emailLink) {
+function findDuplicateRow_(sheet, data, emailLink, emailLinkCheckUpToRow) {
   const lastRow = sheet.getLastRow();
   if (lastRow < 2) return 0;
+
+  // Only check email-link match for rows that existed before the current email started being
+  // processed. This prevents the 2nd/3rd PDF from the same email being falsely flagged as a
+  // duplicate of the row written for the 1st PDF.
+  const emailLinkCutoff = (emailLinkCheckUpToRow && emailLinkCheckUpToRow >= 1) ? emailLinkCheckUpToRow : lastRow;
 
   const values = sheet.getRange(2, 1, lastRow - 1, 15).getValues();
   const emailRichValues = sheet.getRange(2, COL.SOURCE_EMAIL, lastRow - 1, 1).getRichTextValues();
@@ -889,7 +982,7 @@ function findDuplicateRow_(sheet, data, emailLink) {
     const existingEmailRich = emailRichValues[i][0];
     const existingEmailLink = existingEmailRich ? (existingEmailRich.getLinkUrl() || '') : '';
 
-    if (emailLink && existingEmailLink && emailLink === existingEmailLink) return rowNum;
+    if (emailLink && existingEmailLink && emailLink === existingEmailLink && rowNum <= emailLinkCutoff) return rowNum;
 
     // Strong duplicate: same invoice no + supplier + billed_to
     if (
@@ -1265,4 +1358,87 @@ function truncate_(text, maxLen) {
 
 function nullToEmpty_(value) {
   return value === null || value === undefined ? '' : value;
+}
+
+// ============================================================
+// BACKFILL
+// ============================================================
+
+/**
+ * Backfill scan for a specific date range.
+ * Ignores the processed label so previously-labelled emails are re-evaluated.
+ * Duplicate detection still prevents sheet duplication.
+ *
+ * Usage: adjust BACKFILL_CONFIG below, then run backfillScan() from the editor.
+ */
+const BACKFILL_CONFIG = {
+  FROM_DATE:   '2026-04-27',  // inclusive, YYYY-MM-DD (Africa/Johannesburg)
+  TO_DATE:     '2026-04-29',  // inclusive, YYYY-MM-DD (Africa/Johannesburg)
+  MAX_RESULTS: 50,
+};
+
+function backfillScan() {
+  const since = new Date(BACKFILL_CONFIG.FROM_DATE + 'T00:00:00+02:00');
+  const until = new Date(BACKFILL_CONFIG.TO_DATE + 'T23:59:59+02:00');
+
+  const afterDate  = Utilities.formatDate(since, 'UTC', 'yyyy/MM/dd');
+  const beforeDate = Utilities.formatDate(new Date(until.getTime() + 86400000), 'UTC', 'yyyy/MM/dd');
+
+  const rawQuery =
+    'in:anywhere after:' + afterDate +
+    ' before:' + beforeDate +
+    ' -from:neil@lumepay.com' +
+    ' -(subject:"[Lumepay] Invoice scan")' +
+    ' -(subject:"[LUMEPAY] Invoice automation fatal error")' +
+    ' (to:expense@lumepay.com OR from:expense@lumepay.com OR cc:expense@lumepay.com)';
+
+  log_('=== Backfill scan started (' + BACKFILL_CONFIG.FROM_DATE + ' → ' + BACKFILL_CONFIG.TO_DATE + ') ===');
+  log_('Backfill query: ' + rawQuery);
+
+  const url =
+    'https://gmail.googleapis.com/gmail/v1/users/me/messages?q=' +
+    encodeURIComponent(rawQuery) +
+    '&maxResults=' + encodeURIComponent(String(BACKFILL_CONFIG.MAX_RESULTS));
+
+  const resp = UrlFetchApp.fetch(url, {
+    method: 'get',
+    headers: gmailHeaders_(),
+    muteHttpExceptions: true,
+  });
+  assertHttpOk_(resp, 'Backfill search failed');
+
+  const messageIds = (JSON.parse(resp.getContentText()).messages || []).map(function(m) { return m.id; });
+  log_('Backfill messages found: ' + messageIds.length);
+
+  const results = { processed: 0, invoices: 0, flagged: 0, duplicates: 0, pdf_saved: 0, pdf_uploaded: 0, skipped: 0, errors: [] };
+
+  let processedLabelId = '';
+  if (CONFIG.APPLY_PROCESSED_LABEL) {
+    processedLabelId = getOrCreateLabelId_(CONFIG.PROCESSED_LABEL_NAME);
+  }
+
+  for (const msgId of messageIds) {
+    let subjectForLog = msgId;
+    try {
+      const msg = fetchFullMessage_(msgId);
+      const fields = extractMessageFields_(msg);
+      subjectForLog = fields.subject || msgId;
+      log_('Backfill processing: "' + subjectForLog + '"');
+
+      processMessage_(msg, fields, results);
+      results.processed++;
+
+      if (CONFIG.APPLY_PROCESSED_LABEL && processedLabelId) {
+        try { applyLabel_(msgId, processedLabelId); } catch (e) { log_('Label skipped: ' + safeError_(e)); }
+      }
+
+      Utilities.sleep(CONFIG.LOOP_SLEEP_MS);
+    } catch (err) {
+      const message = safeError_(err);
+      log_('Backfill error on "' + subjectForLog + '": ' + message);
+      results.errors.push({ subject: subjectForLog, error: message });
+    }
+  }
+
+  log_('=== Backfill complete: ' + JSON.stringify(results) + ' ===');
 }
