@@ -919,22 +919,25 @@ function writeInvoiceToSheet_(data, msgId, fields, status, driveFile, emlFile, e
   row[COL.PAYMENT_RUN_DATE - 1] = paymentRunDate;
   row[COL.STATUS - 1] = status;
   row[COL.CONFIDENCE - 1] = Math.round(Number(data.confidence || 0) * 100) + '%';
+  const emlLabel = emlFile ? emlFile.getName().replace(/\.eml$/i, '') : '';
+  const invoiceLabel = driveFile ? driveFile.getName().replace(/\.pdf$/i, '') : '';
+
   row[COL.SOURCE_EMAIL - 1] = emailLink ? 'Email' : '';
-  row[COL.SOURCE_INVOICE - 1] = driveFileUrl ? 'Invoice' : '';
+  row[COL.SOURCE_INVOICE - 1] = invoiceLabel;
   row[COL.DATE_EMAIL_RECEIVED - 1] = dateEmailReceived;
   row[COL.DATE_ADDED - 1] = Utilities.formatDate(new Date(), 'Africa/Johannesburg', 'yyyy-MM-dd HH:mm');
-  row[COL.SOURCE_EML - 1] = emlFileUrl ? 'EML' : '';
+  row[COL.SOURCE_EML - 1] = emlLabel;
 
   sheet.appendRow(row);
   const lastRow = sheet.getLastRow();
 
   // Columns K, L, M (SOURCE_EML=11, SOURCE_INVOICE=12, SOURCE_EMAIL=13) — contiguous, set in one call
   const richLinks = [[
-    emlFileUrl
-      ? SpreadsheetApp.newRichTextValue().setText('EML').setLinkUrl(emlFileUrl).build()
+    emlLabel
+      ? SpreadsheetApp.newRichTextValue().setText(emlLabel).setLinkUrl(emlFileUrl).build()
       : SpreadsheetApp.newRichTextValue().setText('').build(),
-    driveFileUrl
-      ? SpreadsheetApp.newRichTextValue().setText('Invoice').setLinkUrl(driveFileUrl).build()
+    invoiceLabel
+      ? SpreadsheetApp.newRichTextValue().setText(invoiceLabel).setLinkUrl(driveFileUrl).build()
       : SpreadsheetApp.newRichTextValue().setText('').build(),
     emailLink
       ? SpreadsheetApp.newRichTextValue().setText('Email').setLinkUrl(emailLink).build()
