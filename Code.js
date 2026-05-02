@@ -424,12 +424,18 @@ function getDriveMonthFolder_(dateObj) {
   return getOrCreateSubfolder_(yearFolder, monthNum + '. ' + monthName);
 }
 
+function getDriveDayFolder_(dateObj) {
+  const day = Utilities.formatDate(dateObj, 'Africa/Johannesburg', 'd');
+  const monthName = Utilities.formatDate(dateObj, 'Africa/Johannesburg', 'MMMM');
+  return getOrCreateSubfolder_(getDriveMonthFolder_(dateObj), day + ' ' + monthName);
+}
+
 function getDrivePdfFolder_(dateObj) {
-  return getOrCreateSubfolder_(getDriveMonthFolder_(dateObj), 'PDF Invoices');
+  return getOrCreateSubfolder_(getDriveDayFolder_(dateObj), 'PDF Invoices');
 }
 
 function getDriveEmlFolder_(dateObj) {
-  return getOrCreateSubfolder_(getDriveMonthFolder_(dateObj), 'EML Containing Invoices');
+  return getOrCreateSubfolder_(getDriveDayFolder_(dateObj), 'EML Containing Invoices');
 }
 
 function getOrCreateSubfolder_(parent, name) {
